@@ -2,16 +2,12 @@
 #include <fstream>
 #include <vector>
 #include <string>
-#include <bitset> 
-
+#include <cstring>
 
 struct WAVHeader {
-    // RIFF Header
     char riff[4];
     uint32_t fileSize;
     char wav[4];
-
-    // Format Chunk
     char fmt[4];
     uint32_t fmtSize;
     uint16_t audioFormat;
@@ -20,187 +16,298 @@ struct WAVHeader {
     uint32_t byteRate;
     uint16_t blockAlign;
     uint16_t bitsPerSample;
-
-    // Data Chunk
     char data[4];
     uint32_t dataSize;
-
 };
 
 struct WAVFile {
     WAVHeader header;
-    std::vector<int16_t> samples;  // Audio samples (16-bit signed integers)
+    std::vector<int16_t> samples;
 };
 
 WAVFile readWAVFile(const std::string& filePath) {
     WAVFile wavFile;
-
     std::ifstream file(filePath, std::ios::binary);
+    
     if (!file) {
-        std::cerr << "Cannot open file!" << std::endl;
+        std::cerr << "ERROR: Cannot open file!" << std::endl;
         return wavFile;
     }
 
-    // Read header
     file.read(reinterpret_cast<char*>(&wavFile.header), sizeof(WAVHeader));
 
-    // Validate
     if (std::strncmp(wavFile.header.riff, "RIFF", 4) != 0 ||
         std::strncmp(wavFile.header.wav, "WAVE", 4) != 0) {
-        std::cerr << "Not a valid WAV file!" << std::endl;
+        std::cerr << "ERROR: Not a valid WAV file!" << std::endl;
         return wavFile;
     }
 
     if (wavFile.header.audioFormat != 1) {
-        std::cerr << "Only PCM format is supported!" << std::endl;
+        std::cerr << "ERROR: Only PCM format is supported!" << std::endl;
         return wavFile;
     }
 
     if (wavFile.header.bitsPerSample != 16) {
-        std::cerr << "Only 16-bit audio is supported!" << std::endl;
+        std::cerr << "ERROR: Only 16-bit audio is supported!" << std::endl;
         return wavFile;
     }
 
-    // Calculate number of samples
     size_t numSamples = wavFile.header.dataSize / sizeof(int16_t);
     wavFile.samples.resize(numSamples);
-
-    // Read all audio samples
-    file.read(reinterpret_cast<char*>(wavFile.samples.data()),
-        wavFile.header.dataSize);
-
+    file.read(reinterpret_cast<char*>(wavFile.samples.data()), wavFile.header.dataSize);
     file.close();
-
-    std::cout << "Successfully read " << numSamples << " samples" << std::endl;
 
     return wavFile;
 }
 
-void displayWAVInfo(const WAVFile& wav) {
-    std::cout << "=== WAV File Information ===" << std::endl;
-    std::cout << "Channels: " << wav.header.numberOfChannels << std::endl;
-    std::cout << "Sample Rate: " << wav.header.sampleRate << " Hz" << std::endl;
-    std::cout << "Bits Per Sample: " << wav.header.bitsPerSample << std::endl;
-    std::cout << "Total Samples: " << wav.samples.size() << std::endl;
-
-    float duration = (float)wav.header.dataSize / wav.header.byteRate;
-    std::cout << "Duration: " << duration << " seconds" << std::endl;
-
-    std::cout << "\nFirst 10 samples: ";
-    for (size_t i = 0; i < 10 && i < wav.samples.size(); i++) {
-        std::cout << wav.samples[i] << " ";
+std::vector<uint8_t> readFile(const std::string& filePath) {
+    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        std::cerr << "ERROR: Can't open input file" << std::endl;
+        return {};
     }
-    std::cout << std::endl;
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> buffer(size);
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        std::cerr << "ERROR: Failed reading file" << std::endl;
+        return {};
+    }
+
+    return buffer;
 }
 
-// Function to hide a message in the audio samples
-void hideMessage(WAVFile& wav, const std::string& message) {
-    // Calculate how many bits we need to hide
-    size_t messageBits = message.size() * 8;  // Each character = 8 bits
+std::string getFileName(const std::string& path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos != std::string::npos) {
+        return path.substr(pos + 1);
+    }
+    return path;
+}
 
-    // Check if we have enough samples
-    if (messageBits > wav.samples.size()) {
-        std::cerr << "Error: Message too long for this audio file!" << std::endl;
-        return;
+bool hideFile(WAVFile& wav, const std::string& filePath) {
+    std::vector<uint8_t> fileData = readFile(filePath);
+    
+    if (fileData.empty()) {
+        return false;
     }
 
+    std::string fileName = getFileName(filePath);
+    
+    if (fileName.length() > 255) {
+        std::cerr << "ERROR: Filename too long (max 255 chars)" << std::endl;
+        return false;
+    }
 
-    size_t sampleIndex = 0; 
+    // Calculate total bits needed:
+    // 4 bytes for file size + 1 byte for filename length + filename + file data
+    uint32_t fileSize = fileData.size();
+    uint8_t nameLen = fileName.length();
+    size_t totalBits = (4 + 1 + nameLen + fileSize) * 8;
 
-    for (size_t i = 0; i < message.size(); i++) {
-        char c = message[i];
+    if (totalBits > wav.samples.size()) {
+        std::cerr << "ERROR: File too large! Need " << totalBits / 8 
+                  << " bytes but only have " << wav.samples.size() / 8 << " bytes available." << std::endl;
+        return false;
+    }
 
-        // Loop through each bit in the character (8 bits per character)
+    size_t idx = 0;
+
+    // Embed file size (32 bits)
+    for (int i = 0; i < 32; i++) {
+        int bit = (fileSize >> i) & 1;
+        if (bit) {
+            wav.samples[idx] |= 1;
+        } else {
+            wav.samples[idx] &= ~1;
+        }
+        idx++;
+    }
+
+    // Embed filename length (8 bits)
+    for (int i = 0; i < 8; i++) {
+        int bit = (nameLen >> i) & 1;
+        if (bit) {
+            wav.samples[idx] |= 1;
+        } else {
+            wav.samples[idx] &= ~1;
+        }
+        idx++;
+    }
+
+    // Embed filename
+    for (size_t i = 0; i < nameLen; i++) {
+        uint8_t byte = fileName[i];
         for (int bitPos = 0; bitPos < 8; bitPos++) {
-
-            // This expression >> shifts the binary to right N number of times
-            // Example: c = 10011, bitPos = 3, c >> bitPos = 00100
-            int bit = (c >> bitPos) & 1;
-
-            // Modify the LSB of the current sample
-            if (bit == 1) {
-                // Set LSB to 1 with | 1
-                wav.samples[sampleIndex] = wav.samples[sampleIndex] | 1;
+            int bit = (byte >> bitPos) & 1;
+            if (bit) {
+                wav.samples[idx] |= 1;
+            } else {
+                wav.samples[idx] &= ~1;
             }
-            else {
-                // This & ~1 clears LSB
-                wav.samples[sampleIndex] = wav.samples[sampleIndex] & ~1;
-            }
-
-            sampleIndex++;
+            idx++;
         }
     }
 
-    std::cout << "Message hidden successfully!" << std::endl;
-}
-
-// Function to extract a message from the audio samples
-std::string extractMessage(const WAVFile& wav, size_t messageLength) {
-    std::string message = "";
-
-    size_t sampleIndex = 0; 
-
-    for (size_t i = 0; i < messageLength; i++) {
-        char c = 0;  // Start with empty character
-
+    // Embed file data
+    for (size_t i = 0; i < fileData.size(); i++) {
+        uint8_t byte = fileData[i];
         for (int bitPos = 0; bitPos < 8; bitPos++) {
-            int bit = wav.samples[sampleIndex] & 1;
-
-
-            c = c | (bit << bitPos);
-
-            sampleIndex++; 
+            int bit = (byte >> bitPos) & 1;
+            if (bit) {
+                wav.samples[idx] |= 1;
+            } else {
+                wav.samples[idx] &= ~1;
+            }
+            idx++;
         }
-
-        message += c;
     }
 
-    return message;
+    std::cout << "SUCCESS: Hidden " << fileSize << " bytes (" << fileName << ")" << std::endl;
+    return true;
 }
 
-// Function to write WAV file back to disk
+bool extractFile(const WAVFile& wav, const std::string& outputDir) {
+    size_t idx = 0;
+
+    // Extract file size
+    uint32_t fileSize = 0;
+    for (int i = 0; i < 32; i++) {
+        int bit = wav.samples[idx] & 1;
+        fileSize |= (bit << i);
+        idx++;
+    }
+
+    if (fileSize == 0 || fileSize > wav.samples.size() / 8) {
+        std::cerr << "ERROR: Invalid file size. No hidden file or corrupted data." << std::endl;
+        return false;
+    }
+
+    // Extract filename length
+    uint8_t nameLen = 0;
+    for (int i = 0; i < 8; i++) {
+        int bit = wav.samples[idx] & 1;
+        nameLen |= (bit << i);
+        idx++;
+    }
+
+    if (nameLen == 0 || nameLen > 255) {
+        std::cerr << "ERROR: Invalid filename length." << std::endl;
+        return false;
+    }
+
+    // Extract filename
+    std::string fileName;
+    for (size_t i = 0; i < nameLen; i++) {
+        uint8_t byte = 0;
+        for (int bitPos = 0; bitPos < 8; bitPos++) {
+            int bit = wav.samples[idx] & 1;
+            byte |= (bit << bitPos);
+            idx++;
+        }
+        fileName += static_cast<char>(byte);
+    }
+
+    // Extract file data
+    std::vector<uint8_t> extractedData(fileSize);
+    for (size_t i = 0; i < fileSize; i++) {
+        uint8_t byte = 0;
+        for (int bitPos = 0; bitPos < 8; bitPos++) {
+            int bit = wav.samples[idx] & 1;
+            byte |= (bit << bitPos);
+            idx++;
+        }
+        extractedData[i] = byte;
+    }
+
+    // Create output path
+    std::string outputPath = outputDir;
+    if (!outputPath.empty() && outputPath.back() != '/' && outputPath.back() != '\\') {
+        outputPath += "/";
+    }
+    outputPath += fileName;
+
+    // Write to file
+    std::ofstream outFile(outputPath, std::ios::binary);
+    if (!outFile) {
+        std::cerr << "ERROR: Can't create output file" << std::endl;
+        return false;
+    }
+
+    outFile.write(reinterpret_cast<const char*>(extractedData.data()), fileSize);
+    outFile.close();
+
+    std::cout << "SUCCESS: Extracted " << fileSize << " bytes to " << outputPath << std::endl;
+    return true;
+}
+
 void writeWAVFile(const std::string& filePath, const WAVFile& wav) {
     std::ofstream file(filePath, std::ios::binary);
-
     if (!file) {
-        std::cerr << "Cannot create file!" << std::endl;
+        std::cerr << "ERROR: Cannot create file!" << std::endl;
         return;
     }
 
-    // Write header
     file.write(reinterpret_cast<const char*>(&wav.header), sizeof(WAVHeader));
-
-    // Write samples
-    file.write(reinterpret_cast<const char*>(wav.samples.data()),
-        wav.header.dataSize);
-
+    file.write(reinterpret_cast<const char*>(wav.samples.data()), wav.header.dataSize);
     file.close();
 
-    std::cout << "WAV file written successfully!" << std::endl;
+    std::cout << "SUCCESS: WAV file written" << std::endl;
 }
 
-int main() {
-    // Read the original WAV file
-    WAVFile wav = readWAVFile("test.wav");
-
-    if (wav.samples.empty()) {
-        std::cerr << "Failed to read WAV file!" << std::endl;
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "ERROR: Missing operation argument" << std::endl;
         return 1;
     }
 
-    std::string secretMessage = "mohamed";
-    hideMessage(wav, secretMessage);
-    writeWAVFile("output.wav", wav);
-    WAVFile modifiedWav = readWAVFile("output.wav");
-    std::string extracted = extractMessage(modifiedWav, secretMessage.size());
+    std::string operation = argv[1];
 
-    std::cout << "\nExtracted message: \"" << extracted << "\"" << std::endl;
+    if (operation == "hide") {
+        if (argc != 5) {
+            std::cerr << "ERROR: Usage: program hide <wav_file> <file_to_hide> <output_wav>" << std::endl;
+            return 1;
+        }
 
-    if (extracted == secretMessage) {
-        std::cout << "SUCCESS! Message matches!" << std::endl;
-    }
-    else {
-        std::cout << "ERROR! Message doesn't match!" << std::endl;
+        std::string wavPath = argv[2];
+        std::string filePath = argv[3];
+        std::string outputPath = argv[4];
+
+        WAVFile wav = readWAVFile(wavPath);
+        if (wav.samples.empty()) {
+            return 1;
+        }
+
+        if (hideFile(wav, filePath)) {
+            writeWAVFile(outputPath, wav);
+            return 0;
+        }
+        return 1;
+
+    } else if (operation == "extract") {
+        if (argc != 4) {
+            std::cerr << "ERROR: Usage: program extract <wav_file> <output_directory>" << std::endl;
+            return 1;
+        }
+
+        std::string wavPath = argv[2];
+        std::string outputDir = argv[3];
+
+        WAVFile wav = readWAVFile(wavPath);
+        if (wav.samples.empty()) {
+            return 1;
+        }
+
+        if (extractFile(wav, outputDir)) {
+            return 0;
+        }
+        return 1;
+
+    } else {
+        std::cerr << "ERROR: Unknown operation. Use 'hide' or 'extract'" << std::endl;
+        return 1;
     }
 
     return 0;
